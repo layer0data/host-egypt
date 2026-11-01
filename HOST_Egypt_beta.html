@@ -672,6 +672,15 @@ const regChange = (name, fn) => { MOD.changes[name] = fn; };
 const regNav = (roles, view, where) => MOD.nav.push({ roles, view, where: where || 'end' });   // roles: ['owner','coach'...]; 'ownerish' allowed
 let S = { lang: store.get('lang') || 'ar', t: store.get('t'), me: null, D: null, view: 'home', sub: '', sel: null, filter: 'active', q: '', saving: 0, month: '', kid: null };
 const isAr = () => S.lang === 'ar';
+/* v4.7: buttons that create a record (a player, a fee, an expense, a sale…) ignore a second tap while the first one is still saving */
+let LOCKS_ = {};
+const LOCK_ACTS = ['lead-register', 'spend-recur', 'uni-sell', 'fees-make', 'pay-waive', 'rep-issue-clean', 'open-session', 'profile-approve', 'placement-move'];
+document.addEventListener('click', ev => {
+  const el = ev.target.closest && ev.target.closest('[data-act]'); if (!el || LOCK_ACTS.indexOf(el.dataset.act) < 0) return;
+  const k = [el.dataset.act, el.dataset.id || el.dataset.pid || el.dataset.sid || '', el.dataset.date || '', el.dataset.start || '', el.dataset.v || ''].join('|');
+  if (LOCKS_[k] && (S.saving > 0 || Date.now() - LOCKS_[k] < 1500)) { ev.stopImmediatePropagation(); ev.preventDefault(); return }
+  LOCKS_[k] = Date.now();
+}, true);
 const L = (en, ar) => isAr() ? (ar || en) : en;
 const LL = o => o ? L(o.en, o.ar) : '';
 
@@ -699,12 +708,12 @@ const PILLARS = [['effort', 'Kept going', 'استمر رغم الصعوبة'], [
 const EXP = [['venue', 'Court rent', 'إيجار الملعب'], ['equipment', 'Equipment', 'أدوات'], ['staff', 'Staff', 'العاملون'], ['marketing', 'Marketing', 'تسويق'], ['transport', 'Transport', 'مواصلات'], ['other', 'Other', 'أخرى']];
 const PAYM = [['cash', 'Cash', 'نقدًا'], ['instapay', 'InstaPay', 'إنستاباي'], ['wallet', 'Mobile wallet', 'محفظة إلكترونية'], ['bank', 'Bank transfer', 'تحويل بنكي']];
 const lab = (arr, id) => { const o = arr.find(x => x[0] === id); return o ? L(o[1], o[2]) : esc(id || '') };
-const dayName = d => L(DAYS[d][0], DAYS[d][1]);
+const dayName = d => { const x = DAYS[d]; return x ? L(x[0], x[1]) : '' };
 
 /* ---------- dates ---------- */
 const pad = n => String(n).padStart(2, '0');
 const ymd = d => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
-const cairoToday = () => { try { return new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Cairo', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()) } catch (e) { return ymd(new Date()) } };
+const cairoToday = () => { try { return new Intl.DateTimeFormat('en-CA', { timeZone: (typeof SET === 'function' && SET().tz) || 'Africa/Cairo', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()) } catch (e) { return ymd(new Date()) } };
 const todayStr = () => (S.D && S.D.today) || ymd(new Date());
 const parseD = s => { const m = String(s || '').match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? new Date(+m[1], +m[2] - 1, +m[3]) : null };
 const LOC = () => isAr() ? 'ar-EG-u-nu-latn' : 'en-GB';
@@ -883,7 +892,7 @@ async function obFlush() {
   if (OB.busy || !S.t || !S.me) return; const mine = obMine(); if (!mine.length) return;
   OB.busy = true; let failed = false, down = false, stop = false, refused = 0; const had = mine.length; OB.busyErr = false;
   try {
-    const groups = {}; mine.forEach(e => { const g = e.item ? 'i|' + e.a + '|' + e.sid : e.rec ? 'r|' + e.kind : 'b|' + e.key; (groups[g] = groups[g] || []).push(e) });
+    const groups = {}; mine.forEach(e => { const g = e.solo ? 's|' + e.key : e.item ? 'i|' + e.a + '|' + e.sid : e.rec ? 'r|' + e.kind : 'b|' + e.key; (groups[g] = groups[g] || []).push(e) });   // v4.7: e.solo = sent on its own after its batch was refused
     for (const g of Object.values(groups)) {
       const e0 = g[0]; const sent = g.map(x => [x.key, x.stamp]);
       const body = e0.item ? Object.assign({ session_id: e0.sid, items: g.map(x => x.item) }, e0.extra || {}) : e0.rec ? { kind: e0.kind, recs: g.map(x => x.rec) } : e0.body;
@@ -894,8 +903,9 @@ async function obFlush() {
         if (err.login) { stop = true; break }                                    // kept; sent after the next login
         /* v4.2.2: a busy server is never a failure of the tap: kept, sent again within seconds, never put aside */
         if (err.net) { failed = true; if (err.migrate) { OB.lastErr = err.server; continue } if (err.kind === 'slow') { OB.slowErr = true; continue } if (err.busy) { OB.busyErr = true; continue } if (err.server) { OB.lastErr = err.server; g.forEach(x => { if (/^HTTP |^bad answer/.test(err.server)) return; x.fails = (x.fails || 0) + 1; if (x.fails >= 8) { x.hold = true; x.err = err.server } }); continue } down = true; break }   // a sheet waiting for its update is not a failure of this item: kept, retried, never put aside
+        if (g.length > 1) { g.forEach(x => { x.solo = true }); obSave(); failed = true; continue }   // v4.7: one bad record must not drop the others: each is sent again on its own
         OB.list = OB.list.filter(x => !sent.some(([k, st]) => x.key === k && x.stamp === st));   // the server refused it for a reason: show the reason, do not retry forever
-        refused++; alertBox(L('Not saved: ', 'لم يُحفظ: ') + err.message); continue;
+        refused++; alertBox(L('Not saved: ', 'لم يُحفظ: ') + err.message); setTimeout(() => { if (S.me && !OB.busy) reload() }, 1500); continue;   // v4.7: the screen goes back to what the academy really has
       }
       OB.list = OB.list.filter(x => !sent.some(([k, st]) => x.key === k && x.stamp === st)); OB.gen++;
       (j.recs || []).forEach(r => { if (r && r.id) upsertLocal(e0.rec ? e0.kind : (a === 'evrecord' || a === 'tap' || a === 'coachrate' || a === 'notebook' ? 'obs' : e0.kind || 'obs'), r) });
@@ -965,18 +975,13 @@ async function quietReload() {
   const m = document.getElementById('modal'); if (m && !m.hidden) return;
   const ae = document.activeElement; if (ae && /INPUT|TEXTAREA|SELECT/.test(ae.tagName)) return;
   if (S.view === 'evaluate' || S.sub === 'eval' || S.view === 'settings' || S.kid || location.hash === '#register') return;
-  const g = OB.gen; try { const j = await api('load'); if (g !== OB.gen || OB.busy || obMine().length) return; applyLoad(j); S.loadedAt = Date.now(); rerender() } catch (e) { }
+  if (S.saving > 0) return;
+  const g = OB.gen, wg = S.wgen || 0; try { const j = await api('load'); if (g !== OB.gen || wg !== (S.wgen || 0) || S.saving > 0 || OB.busy || obMine().length) return; applyLoad(j); S.loadedAt = Date.now(); rerender() } catch (e) { }   // v4.7: dropped when a save happened meanwhile
 }
 /* v4.2.2: a page left open (screen off, another app) catches up as soon as it is shown again, if its data is older than 2 minutes */
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && Date.now() - (S.loadedAt || 0) > 120000) quietReload() });
-setInterval(async () => {
-  if (!S.me || !S.t || document.visibilityState !== 'visible' || obMine().length || OB.busy) return;
-  const m = document.getElementById('modal'); if (m && !m.hidden) return;
-  const ae = document.activeElement; if (ae && /INPUT|TEXTAREA|SELECT/.test(ae.tagName)) return;
-  if (S.view === 'evaluate' || S.sub === 'eval' || S.view === 'settings' || S.kid || location.hash === '#register') return;
-  const g = OB.gen; try { const j = await api('load'); if (g !== OB.gen || OB.busy || obMine().length) return; applyLoad(j); rerender() } catch (e) { }
-}, 60000);
-function busy(n) { S.saving += n; const el = $('#saving'); if (el) el.textContent = S.saving > 0 ? L('Saving…', 'جارٍ الحفظ…') : '' }
+setInterval(quietReload, 60000);   // v4.7: one refresh routine (same checks as above)
+function busy(n) { if (n > 0) S.wgen = (S.wgen || 0) + 1; S.saving += n; if (S.saving <= 0) LOCKS_ = {}; const el = $('#saving'); if (el) el.textContent = S.saving > 0 ? L('Saving…', 'جارٍ الحفظ…') : '' }
 /* plain records: tried at once; on a weak signal they join the outbox instead of being lost */
 async function save(kind, rec, quiet) {
   if (!rec.id) rec.id = newId(kind.slice(0, 2) + '_');
@@ -1110,7 +1115,7 @@ async function doLogin(ev) {
   ev.preventDefault(); const msg = $('#lgMsg'); msg.textContent = L('Checking…', 'جارٍ التحقق…');
   try {
     const as = S.loginAs || (location.hash === '#team' || store.get('as') === 'staff' ? 'staff' : 'parent');
-    const j = await api('login', { who: as, pin: $('#lgPin').value.trim(), phone: ($('#lgPhone') || {}).value || '' });
+    const j = await api('login', { who: as, pin: latinDigits($('#lgPin').value.trim()), phone: latinDigits(($('#lgPhone') || {}).value || '') });
     S.t = j.token; store.set('t', j.token); store.set('as', as); if (location.hash === '#team') history.replaceState(null, '', location.pathname); msg.textContent = L('Opening…', 'جارٍ الفتح…'); await load(); S.view = navItems()[0]; render();
   } catch (e) { msg.textContent = /locked|too many/i.test(e.message) ? L('Too many wrong tries. Please wait 15 minutes, or ask the academy.', 'محاولات خاطئة كثيرة. برجاء الانتظار 15 دقيقة أو اسأل الأكاديمية.') : e.net ? e.message.split('.')[0] + '.' : /nomatch|pin|phone|match/.test(e.message) ? L('The PIN or number does not match. Try again or ask the academy.', 'الرقم السري أو الرقم غير صحيح. حاول مرة أخرى أو اسأل الأكاديمية.') : e.message }
 }
@@ -1272,7 +1277,7 @@ function playersScreen() {
 }
 function playerProfile(p) {
   if (!p) { S.sel = null; return playersScreen() }
-  if (S.viewed !== p.id && role() !== 'marketing') { S.viewed = p.id; act('view', { player_id: p.id }, true).catch(() => { }) }
+  if (S.viewed !== p.id && role() !== 'marketing') { S.viewed = p.id; api('view', { player_id: p.id }).catch(() => { }) }
   const a = attStats(p.id); const tab = S.sub || 'dev';
   const tabs = [['dev', L('Development', 'التطوّر')], ['att', L('Attendance', 'الحضور')], ['notes', L('Notes', 'ملاحظات')]].concat(isAdminish() ? [['family', L('Family and consent', 'العائلة والموافقات')], ['pay', L('Fees', 'الاشتراكات')], ['reports', w('reports')]] : []);
   (MOD.playerTabs || []).forEach(t => { try { if (!t[3] || t[3](p)) tabs.push([t[0], L(t[1][0], t[1][1])]) } catch (e) { } });   // v4 modules: [id, [EN, AR], render(p), show(p)?]
@@ -1800,7 +1805,7 @@ async function flushEv() { clearTimeout(OB.t); for (let i = 0; i < 3 && obMine()
 function coachToday() {
   const nx = upcoming(1).filter(x => !x.closed)[0]; const t = todayStr();
   const waiting = (D().recs || []).filter(r => r.status === 'proposed');
-  const myTaps = sid => (D().obs || []).some(o => o.session_id === sid && o.source === 'coach');
+  const myTaps = sid => (D().obs || []).some(o => o.session_id === sid && o.source === 'coach' && (!o.rater || o.rater === S.me.id));
   const toTap = sessionsDone().filter(s => s.date >= addDays(t, -7) && hereCount(s.id) && s.source !== 'notebook' && s.source !== 'old platform' && !myTaps(s.id));
   const flags = activeP().map(p => ({ p, c: ctxOn(p.id, t) || ctxOn(p.id, addDays(t, -1)) })).filter(x => x.c && (x.c.pain === 'yes' || x.c.sleep === 'poor' || x.c.exam === 'yes' || x.c.mood === 'low'));
   const modCards = MOD.coachToday.map(fn => { try { return fn() } catch (e) { console.error(e); return '' } }).join('');
@@ -1863,7 +1868,7 @@ function changeLine(ch) {
 }
 const workedTxt = wk => (wk && wk.cats || []).map(c => esc(L(c.en, c.ar))).join(' · ')
 const kidFirst = p => esc(String((p && p.name) || '').split(' ')[0]);
-const famNotes = pid => (D().notes || []).filter(n => n.player_id === pid && ['month_plan', 'elite_session', 'kid_msg', 'placement', 'term_confirm'].indexOf(n.type) < 0)   // v4.2: each of these has its own card.sort((a, b) => String(b.date).localeCompare(String(a.date)));
+const famNotes = pid => (D().notes || []).filter(n => n.player_id === pid && ['month_plan', 'elite_session', 'kid_msg', 'placement', 'term_confirm'].indexOf(n.type) < 0).sort((a, b) => String(b.at || b.date || '').localeCompare(String(a.at || a.date || '')));   // v4.2: each of the excluded types has its own card; v4.7: newest first
 const RECORD = { learning: ['Learning about your child', 'نتعرّف على طفلك', 'Fewer than 20 observations so far: we are still getting to know how your child moves and plays.', 'أقل من 20 ملاحظة حتى الآن: ما زلنا نتعرّف على طريقة حركة طفلك ولعبه.'], building: ['Building the record', 'نبني السجل', '20 to 80 observations: the picture is forming; what you read here rests on real sessions.', 'من 20 إلى 80 ملاحظة: الصورة تتكوّن، وما تقرؤه هنا مبني على حصص حقيقية.'], established: ['Established record', 'سجل ثابت', 'More than 80 observations: a solid picture of your child over time.', 'أكثر من 80 ملاحظة: صورة ثابتة لطفلك على مدار الوقت.'] };
 const BAND = { core: ['Steady commitment', 'التزام ثابت', 'This is the rhythm skills grow in. Thank you.', 'هذا هو الإيقاع الذي تنمو فيه المهارات. شكرًا لكم.'], regular: ['A good rhythm', 'إيقاع جيد', 'Most sessions, most weeks. Every extra session adds up.', 'معظم الحصص، معظم الأسابيع. كل حصة إضافية تصنع فرقًا.'], occasional: ['Coming when you can', 'تحضرون عندما تستطيعون', 'Skills move faster with more sessions; tell us if the day or time is hard.', 'تتحرك المهارات أسرع مع حصص أكثر؛ أخبرونا إن كان اليوم أو الوقت صعبًا.'], light: ['We would love to see more of your child', 'نتمنى أن نرى طفلك أكثر', 'If something is in the way, write to us; we will find a way together.', 'إن كان هناك ما يعيق الطريق فاكتبوا لنا؛ سنجد حلًا معًا.'], none: ['No sessions yet', 'لا توجد حصص بعد', 'The commitment picture starts after the first sessions.', 'تبدأ صورة الالتزام بعد الحصص الأولى.'] };
 const FWD = [['looking_forward', 'Looking forward to it', 'متحمس'], ['neutral', 'Neutral', 'عادي'], ['reluctant', 'Reluctant', 'غير راغب']];
@@ -1900,7 +1905,7 @@ function parentScreen() {
     ${v.ups && v.ups.length ? `<ul class="small ups">${v.ups.slice(0, 8).map(ch => `<li>${changeLine(ch)} <button class="link small" data-act="ev-open" data-pid="${esc(p.id)}" data-sk="${ch.skill}">${L('Evidence', 'الدليل')}</button></li>`).join('')}</ul>${v.ups.some(u => u.named === false) ? `<p class="tiny muted">${L('Level names appear once the two evaluators behind a step have been checked against each other; until then we tell you the step in words.', 'تظهر أسماء المستويات عندما نتأكد من أن المقيّمين وراء الخطوة يرون الشيء نفسه؛ وحتى ذلك الحين نصف لكم الخطوة بالكلمات.')}</p>` : ''}` : v.started ? `<p class="small muted">${L(`We know where your child is in ${v.started} skills. Steps forward will appear here after the next 4 sessions.`, `عرفنا موقع طفلك في ${v.started} من المهارات. ستظهر الخطوات القادمة هنا بعد الحصص الـ4 القادمة.`)}</p>` : `<p class="small muted">${L('In the first 4 sessions we get to know your child. After that, every step forward appears here.', 'في أول 4 حصص نتعرّف على طفلك. بعد ذلك ستظهر هنا أي خطوة للأمام.')}</p>`}
     ${v.range ? `<p class="tiny muted">${L('Guidance for age ', 'استرشاد لعمر ')}${v.age}: ${esc(LL(v.range))} ${L('A child outside this is not ahead or behind; the next level is the same for everyone.', 'الطفل خارج هذا النطاق ليس متقدمًا ولا متأخرًا؛ المستوى التالي واحد للجميع.')}</p>` : ''}
     <h3>${L('Who your child is becoming', 'من يصبح طفلك')}</h3><div class="list">${(v.character || []).map(c => `<div class="drow" style="align-items:flex-start"><div class="grow"><b>${esc(L(c.en, c.ar))}</b><div class="small">${c.text ? esc(LL(c.text)) : `<span class="muted">${L('Being observed.', 'قيد الملاحظة.')}</span>`}</div></div></div>`).join('')}</div><p class="tiny muted">${L('Described in words, never graded.', 'يُوصف بالكلمات ولا يُعطى درجة.')}</p></div>
-  <div class="card" data-card="noticed"><h2>${L('What the coach noticed', 'ما لاحظه المدرب')}</h2>${pend.length ? `<div class="notice"><b>${L('Share with your child?', 'مشاركة مع طفلك؟')}</b><p class="tiny muted">${L('Nothing reaches your child without your approval.', 'لا يصل شيء لطفلك دون موافقتك.')}</p>${pend.map(n => `<div class="item" style="cursor:default;flex-wrap:wrap"><div class="grow">${esc(n.text)}<div class="sub">${fmtDS(n.date)}</div></div><button class="btn small" data-act="share" data-id="${esc(n.id)}" data-v="approve">${L('Share', 'شارك')}</button><button class="link small" data-act="share" data-id="${esc(n.id)}" data-v="decline">${L('Not now', 'ليس الآن')}</button></div>`).join('')}</div>` : ''}${notes.length ? `<div class="list">${notes.slice(0, 8).map(n => `<div class="item" style="cursor:default;align-items:flex-start"><div class="grow"><div class="sub">${fmtDS(n.date)} · ${esc(n.by || '')}</div><div>${esc(n.text)}</div></div></div>`).join('')}</div>` : empty()}</div>
+  <div class="card" data-card="noticed"><h2>${L('What the coach noticed', 'ما لاحظه المدرب')}</h2>${pend.length ? `<div class="notice"><b>${L('Share with your child?', 'مشاركة مع طفلك؟')}</b><p class="tiny muted">${L('Nothing reaches your child without your approval.', 'لا يصل شيء لطفلك دون موافقتك.')}</p>${pend.map(n => `<div class="item" style="cursor:default;flex-wrap:wrap"><div class="grow">${esc(n.text)}<div class="sub">${fmtDS(n.date || String(n.at || '').slice(0, 10))}</div></div><button class="btn small" data-act="share" data-id="${esc(n.id)}" data-v="approve">${L('Share', 'شارك')}</button><button class="link small" data-act="share" data-id="${esc(n.id)}" data-v="decline">${L('Not now', 'ليس الآن')}</button></div>`).join('')}</div>` : ''}${notes.length ? `<div class="list">${notes.slice(0, 8).map(n => `<div class="item" style="cursor:default;align-items:flex-start"><div class="grow"><div class="sub">${fmtDS(n.date || String(n.at || '').slice(0, 10))} · ${esc(n.by || '')}</div><div>${esc(n.text)}</div></div></div>`).join('')}</div>` : empty()}</div>
   ${nx.length ? `<div class="card" data-card="checkin"><span class="tag info">${L('Next sessions', 'الحصص القادمة')}</span>${nx.map(x => `<div class="row sp"><b>${fmtDL(x.date)}</b><span class="muted">${fmtT(x.start)} – ${fmtT(x.end)}</span></div>`).join('')}
     <p class="small muted">${esc(placeName())} · ${esc(L(SET().address, SET().address_ar) || '')}</p>
     <div class="row wrap"><button class="btn small" data-act="ctx-open" data-pid="${esc(p.id)}" data-date="${nx[0].date}">${sentNext ? '✓ ' + L('Check-in sent · change', 'أُرسل التحديث · تعديل') : L('Before the session: send a check-in', 'قبل الحصة: أرسل تحديثًا')}</button><button class="btn ghost small" data-act="hold-open" data-pid="${esc(p.id)}">${L('Will be away? Tell us', 'سيغيب؟ أخبرنا')}</button></div>
@@ -1939,7 +1944,7 @@ function journeyCard(p, v) {
   return `<div class="card" data-card="journey"><h2>${L(`${first}’s journey`, `رحلة ${first}`)}</h2>
    <div class="kpis">${kv(L('Months with us', 'أشهر معنا'), num(j.months))}${kv(L('Sessions attended', 'حصص حضرها'), num(j.sessions))}${(() => { const tot = (j.spark || []).reduce((a, x) => a + x.n, 0); return kv(L('Steps forward, last 6 months', 'خطوات للأمام، آخر 6 أشهر'), tot ? `${num(tot)}<div class="sparkwrap">${sparkline((j.spark || []).map(x => x.n), 'count')}</div>` : `<span class="small" style="font-weight:400">${L('None yet: the first ones come after a few weeks', 'لا شيء بعد: تأتي الخطوات الأولى بعد بضعة أسابيع')}</span>`) })()}</div>
    ${j.cats.length ? `<div class="list">${j.cats.map(catRow).join('')}</div>` : `<p class="small muted">${L('The journey by skill area appears after the first 4 sessions.', 'تظهر الرحلة حسب مجال المهارة بعد أول دورة.')}</p>`}
-   <h3>${L('Milestones', 'محطات')}</h3><div class="miles">${(j.milestones || []).map(m => `<span class="chip static ${m.done ? 'done' : ''}">${m.done ? '★ ' : '○ '}${L(...MILESTONE[m.id])}${m.done && m.date ? ` <em>${fmtDS(m.date)}</em>` : ''}</span>`).join('')}</div>
+   <h3>${L('Milestones', 'محطات')}</h3><div class="miles">${(j.milestones || []).map(m => `<span class="chip static ${m.done ? 'done' : ''}">${m.done ? '★ ' : '○ '}${L(...(MILESTONE[m.id] || [esc(m.id), esc(m.id)]))}${m.done && m.date ? ` <em>${fmtDS(m.date)}</em>` : ''}</span>`).join('')}</div>
    ${live.length ? `<h3>${L('One-skill journey this term', 'رحلة مهارة واحدة هذا الفصل')}</h3>${live.slice(0, 2).map(x => journeyBlock(p, x)).join('')}` : ''}
    ${bridges.length ? `<h3>${L('What basketball is building in your child', 'ماذا تبني كرة السلة في طفلك')}</h3><div class="bridges">${bridges.map(b => bridgeCard(b)).join('')}</div>` : ''}</div>`;
 }
@@ -1981,7 +1986,7 @@ function academyPage() {
 function kidPage() {
   const p = P(S.kid); if (!p) { S.kid = null; return parentScreen() }
   const v = (D().view || {})[p.id] || {}; const first = kidFirst(p); const young = kidAge(p) <= 8;
-  if (S.kidSeenFor !== p.id) { S.kidSeenFor = p.id; S.kidFresh = null; act('kid_seen', { player_id: p.id }, true).then(j => { S.kidFresh = j.fresh; (j.ids || []).forEach(id => { const n = (D().notes || []).find(x => x.id === id); if (n) n.kid_seen = j.at }); rerender() }).catch(() => { }) }
+  if (S.kidSeenFor !== p.id) { S.kidSeenFor = p.id; S.kidFresh = null; api('kid_seen', { player_id: p.id }).then(j => { S.kidFresh = j.fresh; (j.ids || []).forEach(id => { const n = (D().notes || []).find(x => x.id === id); if (n) n.kid_seen = j.at }); rerender() }).catch(() => { }) }
   const shared = (D().notes || []).filter(n => n.player_id === p.id && n.child_share === 'approved' && n.type !== 'month_plan' && !n.kid_type).sort((a, b) => String(b.date).localeCompare(String(a.date)));
   const last = (D().attendance || []).filter(a => a.player_id === p.id && isHere(a)).map(a => sesById(a.session_id)).filter(Boolean).sort((a, b) => String(b.date).localeCompare(String(a.date)))[0];
   const tabs = young ? [['stars', L('Stars', 'نجوم')], ['coaches', L('My coaches', 'مدربيّ')], ['powers', L('Superpowers', 'قوى خارقة')], ['cool', L('Cool', 'رائع')]] : [['me', L('Me', 'أنا')], ['moments', L('Moments', 'لحظات')], ['coaches', L('Coaches', 'المدربون')], ['life', L('Life', 'الحياة')]];
@@ -1990,7 +1995,7 @@ function kidPage() {
   const homeTxt = kidVoice(plan ? (isAr() ? plan.ar.home : plan.en.home) : v.next && v.next.home ? LL(v.next.home) : '');
   const wk = weekStart(todayStr()); const didIt = (D().homedone || []).find(h => h.player_id === p.id && h.week === wk && h.kind === 'home');
   const coachOf = n => n.by ? `<span class="tiny muted">— ${L('Coach', 'مدرب')} ${esc(n.by)}</span>` : '';
-  const star = n => `<div class="star"><span class="ic-star">⭐</span><div class="grow"><p class="big">${esc(n.text)}</p>${coachOf(n)} <span class="tiny muted">${fmtDS(n.date)}</span></div></div>`;
+  const star = n => `<div class="star"><span class="ic-star">⭐</span><div class="grow"><p class="big">${esc(n.text)}</p>${coachOf(n)} <span class="tiny muted">${fmtDS(n.date || String(n.at || '').slice(0, 10))}</span></div></div>`;
   const powers = (v.character || []).filter(c => c.text);
   const bridges = bridgesFor(v);
   const live = (D().journeys || []).filter(x => x.player_id === p.id && x.status === 'active')[0];
@@ -2053,7 +2058,7 @@ function reportHtml(r) {
     attendance: `<h3>${L('Attendance', 'الحضور')}</h3><p class="small">${L(`Came to ${a.here} of ${a.sessions} sessions.`, `حضر ${a.here} من الحصص من أصل ${a.sessions}.`)}${a.excused ? ' ' + L(`${a.excused} away period session(s) not counted.`, `حصص الغياب بعذر التي لم تُحسب: ${a.excused}.`) : ''}${s.coaches && s.coaches.list && s.coaches.list.length ? ' ' + L('With ', 'مع ') + s.coaches.list.map(x => L('Coach ', 'المدرب ') + esc(x.name) + ` (${x.n})`).join(', ') + '.' : ''}</p>${s.coaches && s.coaches.sessions && s.coaches.sessions.length ? `<p class="tiny muted">${s.coaches.sessions.map(x => fmtDS(x.date) + (x.coaches.length ? ' · ' + x.coaches.map(esc).join(', ') : '')).join(' · ')}</p>` : ''}`,
     worked: `<h3>${L('What we worked on', 'ما عملنا عليه')}</h3><p class="small">${workedTxt(s.worked) || '–'}${(s.worked || {}).plans && s.worked.plans.length ? ' · ' + s.worked.plans.map(x => esc(L(x.en, x.ar))).join(' · ') : ''}</p>`,
     character: `<h3>${L('How your child responded', 'كيف استجاب طفلك')}</h3><ul class="small">${(s.character || []).map(k => `<li><b>${esc(L(k.en, k.ar))}</b>: ${k.text ? esc(LL(k.text)) : L('being observed', 'قيد الملاحظة')}</li>`).join('')}</ul>`,
-    notes: (s.notes || []).length ? `<p class="small"><b>${L('The coach noticed', 'لاحظ المدرب')}:</b></p><ul class="small">${s.notes.map(n => `<li>${fmtDS(n.date)}: ${esc(n.text)}${n.by ? ` <span class="muted">— ${esc(n.by)}</span>` : ''}</li>`).join('')}</ul>` : '',
+    notes: (s.notes || []).length ? `<p class="small"><b>${L('The coach noticed', 'لاحظ المدرب')}:</b></p><ul class="small">${s.notes.map(n => `<li>${fmtDS(n.date || String(n.at || '').slice(0, 10))}: ${esc(n.text)}${n.by ? ` <span class="muted">— ${esc(n.by)}</span>` : ''}</li>`).join('')}</ul>` : '',
     ups: `<h3>${(s.ups || []).length && s.ups.every(u => u.named === true) ? L('Moved up', 'تقدّم') : L('Steps forward', 'خطوات إلى الأمام')}</h3>${(s.ups || []).length ? `<ul class="small">${s.ups.map(ch => `<li>${changeLine(ch)}</li>`).join('')}</ul>${(s.bridges || []).length ? `<div class="bridges small">${s.bridges.map(b => `<div class="bridge"><b>${esc(L(b.en, b.ar))}</b> · ${L('in sport', 'في الرياضة')}: ${esc(L(b.sport_en, b.sport_ar))} · ${L('in school', 'في المدرسة')}: ${esc(L(b.school_en, b.school_ar))} · ${L('in life', 'في الحياة')}: ${esc(L(b.life_en, b.life_ar))}</div>`).join('')}</div>` : ''}` : s.started ? `<p class="small muted">${L(`In this period we got to know where your child is in ${s.started} skills. Steps forward are reported from the next report.`, `في هذه الفترة عرفنا موقع طفلك في ${s.started} من المهارات. ستظهر الخطوات للأمام بدءًا من التقرير القادم.`)}</p>` : `<p class="small muted">${L('No skill moved up in this period. Skills hold for a while before they move; that is normal.', 'لم تتقدّم مهارة في هذه الفترة. تثبت المهارات فترة قبل أن تتقدّم؛ وهذا طبيعي.')}</p>`}`,
     next: did ? '' : `<h3>${L('What’s next', 'الخطوة التالية')}</h3><p class="small">${s.next ? `<b>${esc(L(s.next.en, s.next.ar))}</b>${s.next.home ? ' · ' + L('at home', 'في المنزل') + ': ' + esc(LL(s.next.home)) : ''}` : (isLight() ? L('The coaches choose the next focus after these sessions.', 'يختار المدربون التركيز التالي بعد هذه الحصص.') : L('The coach chooses the next focus with the evaluators after these sessions.', 'يختار المدرب التركيز التالي مع المقيّمين بعد هذه الحصص.'))}</p>`,
   };
@@ -2179,7 +2184,8 @@ function qualityScreen() {
 function repFlags(r) {
   const sn = r.snapshot || {}; const a = sn.attendance || {}; const f = [];
   if (((S.me && S.me.own_kids) || []).indexOf(r.player_id) >= 0) f.push(L('your own child: another owner approves', 'طفلك: يوافق مالك آخر'));
-  if (!r.snapshot) return [L('not prepared yet', 'لم يُجهَّز بعد')];
+  if ((P(r.player_id) || {}).consent_dev !== 'yes') f.push(L('no family consent', 'بلا موافقة العائلة'));   // v4.7
+  if (!r.snapshot) return f.concat([L('not prepared yet', 'لم يُجهَّز بعد')]);
   if ((a.here || 0) < 3) f.push(L(`only ${a.here || 0} session(s)`, `الحصص: ${a.here || 0} فقط`));
   else if (a.sessions && a.here / a.sessions < 0.5) f.push(L(`came to ${a.here} of ${a.sessions}`, `حضر ${a.here} من ${a.sessions}`));
   if (/pain|injur|hurt|sore|knee|ankle|ألم|وجع|إصاب|ركبة/i.test(JSON.stringify(sn.notes || []) + JSON.stringify(sn.positive || []))) f.push(L('a note mentions pain or injury', 'ملاحظة فيها ألم أو إصابة'));
@@ -2234,8 +2240,8 @@ const feeRows = () => (D().payments || []).filter(x => x.kind !== 'uniform');
 const uniRows = () => (D().payments || []).filter(x => x.kind === 'uniform');
 const famKey = p => famOf(p);   // v4.1: same family rule everywhere (p7_biz.js)
 /* the latest month with a paid fee, per child and per family (the earliest of its children) */
-function paidUntil(pid) { const rows = feeRows().filter(x => x.player_id === pid); if (!rows.length) return (P(pid) || {}).paid_until || ''; const by = {}; rows.forEach(x => by[x.month] = x.status); let pu = ''; Object.keys(by).sort().some(m => { if (by[m] === 'paid' || by[m] === 'waived') { pu = m; return false } return true }); return pu }   // v4.5 (Cowork B16): an unpaid month stops the run
-function paidUntilFamily(p) { const kids = activeP().filter(q => famKey(q) === famKey(p)); const ms = kids.map(q => paidUntil(q.id)).filter(Boolean).sort(); return kids.length && ms.length === kids.length ? ms[0] : (ms[0] || '') }
+function paidUntil(pid) { const rows = feeRows().filter(x => x.player_id === pid); if (!rows.length) return (P(pid) || {}).paid_until || ''; const by = {}; rows.forEach(x => { const cur = by[x.month]; if (!cur || cur === 'paid' || cur === 'waived') by[x.month] = x.status });   /* v4.7: a month with any part still due is not paid */ let pu = ''; Object.keys(by).sort().some(m => { if (by[m] === 'paid' || by[m] === 'waived') { pu = m; return false } return true }); return pu }   // v4.5 (Cowork B16): an unpaid month stops the run
+function paidUntilFamily(p) { const kids = activeP().filter(q => famKey(q) === famKey(p)); const ms = kids.map(q => paidUntil(q.id)).filter(Boolean).sort(); return kids.length && ms.length === kids.length ? ms[0] : '' }   // v4.7: a child with no paid month means the family is not paid up
 /* days since a due fee's month started (payment is due within the month) */
 function feeAge(x) { const t = todayStr(); const start = x.month + '-01'; return start < t ? daysBetween(start, t) : 0 }
 function lastReminder(x) { const r = Array.isArray(x.reminders) ? x.reminders.slice().sort() : []; return r.length ? r[r.length - 1] : '' }
@@ -2653,7 +2659,9 @@ function nextSeason() { const t = todayStr(); return (SET().seasons || []).filte
 function slotsOf(se) { const seen = {}; return (se.slots || []).filter(x => (!TPL_GID || !x.group_id || x.group_id === TPL_GID)).slice().sort((a, b) => (+a.day - +b.day) || String(a.start).localeCompare(String(b.start))).filter(x => { const k = x.day + '|' + x.start + '|' + x.end; if (seen[k]) return false; seen[k] = 1; return true }) }   // v4.5 review: each time once, the child's group when known
 function slotsText(se) { if (!se || !(se.slots || []).length) return ''; return slotsOf(se).map(x => L('every ' + DAYS[x.day][0], 'كل ' + DAYS[x.day][1]) + ' ' + fmtT(x.start) + '–' + fmtT(x.end)).join(L(' and ', ' و')) }
 /* a message that would go out with blanks is stopped, with what to set first */
+const tplPinMissing = id => /\{pin\}/.test(String(tplText(id, 'en') || '') + String(tplText(id, 'ar') || '')) ? L('A family PIN is stored safely and cannot be put in a group message. Open the child, Family tab, set a new PIN and send it from there.', 'الرقم السري للعائلة محفوظ بأمان ولا يمكن وضعه في رسالة جماعية. افتح ملف الطفل، تبويب العائلة، اضبط رقمًا سريًا جديدًا وأرسله من هناك.') : '';   // v4.7
 function tplMissing(id) {
+  if (tplPinMissing(id)) return tplPinMissing(id);
   if (id === 'cancelled' && !upcoming(12).some(x => x.closed)) return L('No day off is set yet. First mark it: Settings > Season and days > Days off, or open the session and set its status to Cancelled.', 'لم يُحدَّد يوم إجازة بعد. حدّده أولًا: الإعدادات > الموسم والأيام > أيام الإجازة، أو افتح الحصة واجعل حالتها «ملغية».');
   if (id === 'schedule' && !slotsText(nextSeason())) return L('No next season with days and times is set. First add it: Settings > Season and days.', 'لا يوجد موسم قادم بأيام ومواعيد محددة. أضفه أولًا: الإعدادات > الموسم والأيام.');
   if ((id === 'reminder' || id === 'checkin' || id === 'trial_invite' || id === 'welcome') && !upcoming(3).some(x => !x.closed)) return L('There is no coming session in the season dates. First check Settings > Season and days.', 'لا توجد حصة قادمة في مواعيد الموسم. راجع الإعدادات > الموسم والأيام.');
@@ -2709,17 +2717,18 @@ function recipients(c) {
 /* quiet hours (Settings → Business): a send outside them is allowed after a warning; the weekly cap counts the log per phone over 7 days */
 function quietNow() {
   const q = SET().quiet_hours || {}; if (!q.from || !q.to) return false;
-  let hm; try { hm = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Cairo', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date()) } catch (e) { const d = new Date(); hm = pad(d.getHours()) + ':' + pad(d.getMinutes()) }
+  let hm; try { hm = new Intl.DateTimeFormat('en-GB', { timeZone: SET().tz || 'Africa/Cairo', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date()) } catch (e) { const d = new Date(); hm = pad(d.getHours()) + ':' + pad(d.getMinutes()) }
   hm = hm.replace('24:', '00:'); return q.from <= q.to ? (hm >= q.from && hm < q.to) : (hm >= q.from || hm < q.to);
 }
 function msgsThisWeek(phone) { const n = waNum(phone); if (!n) return 0; const since = new Date(Date.now() - 7 * 864e5).toISOString(); return (D().messages || []).filter(m => String(m.at) >= since && waNum(m.phone) === n).length }
 function composeModal(c) {
+  if (c && c.tpl) S.sentNow = {};   // v4.7: a new compose starts with no ✓
   S.cmp = c = Object.assign({ tpl: 'general', aud: 'active', lang: 'auto' }, S.cmp && S.cmp._keep ? S.cmp : {}, c || {});
   if (c.pids || c.lids) c.aud = 'list';
   if (!c.bases) { c.bases = { ar: tplText(c.tpl, 'ar'), en: tplText(c.tpl, 'en') }; if (c.extra) ['ar', 'en'].forEach(lg => { c.bases[lg] = c.bases[lg].replace(/\{(\w+)\}/g, (m, k) => c.extra[k + '_' + lg] !== undefined ? c.extra[k + '_' + lg] : c.extra[k] !== undefined ? c.extra[k] : m) }) }
   const famLang = r => c.lang !== 'auto' ? c.lang : ((r.player && r.player.lang) || (r.lead && r.lead.lang) || 'ar');
   const rs = recipients(c); const cap = +SET().weekly_msg_cap || 0; const quiet = quietNow(); const q = SET().quiet_hours || {};
-  const missing = c.pids || c.lids ? '' : tplMissing(c.tpl);
+  const missing = c.pids || c.lids ? tplPinMissing(c.tpl) : tplMissing(c.tpl);
   modal(`<h2>${L('Message', 'رسالة')}: ${esc(tplName(c.tpl))}</h2>
   <div class="grid2"><label class="f">${L('Message', 'الرسالة')}<select class="in" data-chg="cmp-tpl">${Object.keys(TPL).map(k => `<option value="${k}" ${k === c.tpl ? 'selected' : ''}>${esc(tplName(k))}</option>`).join('')}</select></label>
   ${c.pid || c.lead ? '' : c.aud === 'list' ? `<label class="f">${L('To', 'إلى')}<input class="in" value="${esc(L(`${rs.length} picked by the message centre`, `${rs.length} اختارهم مركز الرسائل`))}" disabled></label>` : `<label class="f">${L('To', 'إلى')}<select class="in" data-chg="cmp-aud">${audiences().map(a => `<option value="${a[0]}" ${a[0] === c.aud ? 'selected' : ''}>${a[1]}</option>`).join('')}</select></label>`}
@@ -2898,7 +2907,8 @@ function exportData() {
 
 
 /* ================= events ================= */
-function formObj(f) { const o = {}; new FormData(f).forEach((v, k) => { if (o[k] !== undefined) { if (!Array.isArray(o[k])) o[k] = [o[k]]; o[k].push(v) } else o[k] = v }); return o }
+const latinDigits = v => String(v == null ? '' : v).replace(/[\u0660-\u0669]/g, c => String(c.charCodeAt(0) - 0x0660)).replace(/[\u06F0-\u06F9]/g, c => String(c.charCodeAt(0) - 0x06F0));   // v4.7
+function formObj(f) { const o = {}; const numF = {}; [...(f.elements || [])].forEach(el => { if (el.name && (/^(number|tel|password)$/.test(el.type) || /numeric|decimal|tel/.test(el.inputMode || el.getAttribute('inputmode') || ''))) numF[el.name] = 1 }); new FormData(f).forEach((v, k) => { if (numF[k] && typeof v === 'string') v = latinDigits(v); if (o[k] !== undefined) { if (!Array.isArray(o[k])) o[k] = [o[k]]; o[k].push(v) } else o[k] = v }); return o }
 function openWa(href) { const a = document.createElement('a'); a.href = href; a.target = '_blank'; a.rel = 'noopener'; document.body.appendChild(a); a.click(); a.remove() }
 async function copyText(t) { try { await navigator.clipboard.writeText(t); toast('✓ ' + L('Copied', 'نُسخ')) } catch (e) { toast(L('Press and hold to copy', 'اضغط مطولًا للنسخ')) } }
 /* everything recorded at the court goes through the outbox (p2_core): kept on the phone until the Sheet confirms it */
@@ -3091,9 +3101,11 @@ document.addEventListener('input', ev => {
   const el = ev.target; if (el.dataset && el.dataset.input === 'q') { S.q = el.value; const pos = el.selectionStart; rerender(); const n = $('#pq'); if (n) { n.focus(); try { n.setSelectionRange(pos, pos) } catch (e) { } } }
 });
 document.addEventListener('submit', async ev => {
-  const f = ev.target; ev.preventDefault(); const o = formObj(f); const id = f.dataset.id;
+  const f = ev.target; ev.preventDefault();
+  if (f.__busy) return; f.__busy = true; const sbs = [...f.querySelectorAll('button[type="submit"],button:not([type])')]; sbs.forEach(b => { b.disabled = true });   // v4.7: one send per tap
+  const o = formObj(f); const id = f.dataset.id;
   try {
-    if (f.id === 'loginForm') return doLogin(ev);
+    if (f.id === 'loginForm') return await doLogin(ev);
     if (MOD.forms && MOD.forms[f.id]) return await MOD.forms[f.id](o, f, id);
     if (f.id === 'regForm') return submitReg(f);
     if (f.id === 'pastForm') { modal(''); S.evStep = ''; await openSessionFor(o.date, o.start, { end: o.end, coach: o.coach, source: o.source || 'notebook', status: 'done' }); if (o.source === 'notebook') { S.sub = 'att'; rerender() } return }
@@ -3108,7 +3120,15 @@ document.addEventListener('submit', async ev => {
     if (f.id === 'pHoldForm') { const rec = { id: newId('ho_'), player_id: f.dataset.pid, kind: o.kind, from: o.from, to: o.to || o.from, note: o.note }; queueFam('holds', rec, [['holds', Object.assign({ by: S.me.name, by_role: 'parent' }, rec)]]); modal(''); rerender(); return }
     if (f.id === 'famfbForm') { const month = monthKey(todayStr()); const rec = { id: 'ff_' + f.dataset.pid + '_' + month, player_id: f.dataset.pid, month, enjoy: +o.enjoy, clarity: +o.clarity, comms: +o.comms, organisation: +o.organisation, value: +o.value, comment: o.comment || '' }; queueFam('famfb', rec, [['famfb', Object.assign({ at: famNow() }, rec)]]); modal(''); rerender(); return }
     if (f.id === 'voiceForm') { queueFam('voice', { id: 'v_' + f.dataset.sid + '_' + f.dataset.pid, player_id: f.dataset.pid, session_id: f.dataset.sid, fun: +o.fun, learned: +o.learned, help: !!o.help }, []); store.set('voice-' + f.dataset.sid + '-' + f.dataset.pid, '1'); render(); return }
-    if (f.id === 'payForm') { const x = (D().payments || []).find(r => r.id === id); await save('payments', Object.assign({}, x, { amount: +o.amount || x.amount, paid_at: o.paid_at, method: o.method, ref: o.ref, status: 'paid' })); modal(''); rerender(); return }
+    if (f.id === 'payForm') {
+      const x = (D().payments || []).find(r => r.id === id); const due = +x.amount || 0; const got = String(o.amount == null ? '' : o.amount).trim() === '' ? due : +o.amount;   // v4.7: an amount of 0 is kept as 0
+      if (!(got >= 0)) { toast('⚠ ' + L('Please type the amount received.', 'برجاء كتابة المبلغ المستلم.')); return }
+      if (got > 0 && got < due && !confirm(L(`${num(got)} is less than the ${num(due)} due. OK = record it as fully paid. Cancel = keep the remaining ${num(due - got)} as still due.`, `${num(got)} أقل من المستحق ${num(due)}. موافق = تسجيله مدفوعًا بالكامل. إلغاء = يبقى الباقي ${num(due - got)} مستحقًا.`))) {
+        await save('payments', Object.assign({}, x, { amount: got, paid_at: o.paid_at, method: o.method, ref: o.ref, status: 'paid' }));
+        await save('payments', Object.assign({}, x, { id: newId('pa_'), amount: due - got, paid_at: '', method: '', ref: '', status: 'due', note: L('remaining part', 'الجزء المتبقي') }));
+      } else await save('payments', Object.assign({}, x, { amount: got, paid_at: o.paid_at, method: o.method, ref: o.ref, status: 'paid' }));
+      modal(''); rerender(); return
+    }
     if (f.id === 'expForm') { await save('expenses', { id: newId('ex'), date: o.date, category: o.category, amount: +o.amount || 0, note: o.note }); rerender(); return }
     if (f.id === 'bridgeForm') { const dr = draftSettings(); dr.legacy_level = {}; [1, 2, 3, 4, 5].forEach(k => dr.legacy_level[k] = +o['m' + k]); await saveSettings(dr); S.draft = null; await reload(); return }
     if (f.id === 'groupForm') { const rec = Object.assign({}, id ? groups().find(x => x.id === id) : {}, o, { id: id || newId('g'), active: 'yes' }); await save('groups', rec); modal(''); rerender(); return }
@@ -3118,6 +3138,7 @@ document.addEventListener('submit', async ev => {
     if (f.id === 'compForm') { const rec = Object.assign({}, id ? (D().competitors || []).find(x => x.id === id) : {}, o); if (!rec.id) rec.id = newId('x'); await save('competitors', rec); modal(''); rerender(); return }
     if (f.id === 'userForm') { const rec = Object.assign({}, id ? (D().users || []).find(x => x.id === id) : {}, o); rec.own_kids = [].concat(o.own_kids || []); if (footballOn()) rec.sports = [].concat(o.sports || []); if (branches().length > 1) rec.branches = [].concat(o.branches || []); if (!rec.id) rec.id = newId('u'); await save('users', rec); modal(''); await load(); rerender(); return }
   } catch (e) { /* the reason was already shown */ }
+  finally { f.__busy = false; sbs.forEach(b => { b.disabled = false }) }
 });
 window.addEventListener('hashchange', render);
 
@@ -3218,11 +3239,12 @@ function msgCentreCard(items, full) {
   items = items || msgCentreItems(); if (!full && !items.length) return '';
   return `<div class="card"><div class="row sp"><h2>${L('Message centre · due today', 'مركز الرسائل · المطلوب اليوم')}</h2><span class="tag ${items.length ? 'attn' : 'ok'}">${items.length}</span></div>
    <p class="tiny muted">${L('Each item is built from your data: who, why and a draft in both languages. Nothing is sent until you tap WhatsApp for each family; every send is logged.', 'كل بند مبني من بياناتك: لمن، ولماذا، ومسودة بالعربية والإنجليزية. لا يُرسل شيء إلا عندما تضغط واتساب لكل عائلة؛ وكل إرسال يُسجّل.')}</p>
-   ${items.length ? `<div class="list">${items.map((it, i) => `<div class="item" style="cursor:default;flex-wrap:wrap"><span class="dot" style="background:${it.color || 'var(--accent)'}"></span><div class="grow"><div class="nm">${it.title}</div><div class="sub">${esc(tplName(it.tpl))} · ${it.why}</div></div>${it.pay ? `<button class="btn small ghost" data-act="pay-open" data-id="${it.pay}">${L('Mark paid', 'سجّل الدفع')}</button>` : ''}<button class="btn small wa" data-act="mc-open" data-i="${i}">${L('Prepare', 'جهّز')}</button></div>`).join('')}</div>` : empty(L('Nothing due today. Enjoy the quiet.', 'لا يوجد شيء مطلوب اليوم.'))}
+   ${items.length ? `<div class="list">${items.map((it, i) => `<div class="item" style="cursor:default;flex-wrap:wrap"><span class="dot" style="background:${it.color || 'var(--accent)'}"></span><div class="grow"><div class="nm">${it.title}</div><div class="sub">${esc(tplName(it.tpl))} · ${it.why}</div></div>${it.pay ? `<button class="btn small ghost" data-act="pay-open" data-id="${it.pay}">${L('Mark paid', 'سجّل الدفع')}</button>` : ''}<button class="btn small wa" data-act="mc-open" data-i="${i}" data-k="${esc(mcKey(it))}">${L('Prepare', 'جهّز')}</button></div>`).join('')}</div>` : empty(L('Nothing due today. Enjoy the quiet.', 'لا يوجد شيء مطلوب اليوم.'))}
    ${full ? `<p class="tiny muted">${L('Triggers: cancelled session, absent two weeks, birthdays, fees (general from the 25th, private per family), report issued, new term within 21 days, welcome, events, monthly plan, check-in the day before, skills day, monthly feedback, free-session follow-up.', 'المحفّزات: حصة ملغاة، غياب أسبوعين، أعياد ميلاد، الاشتراكات (عام من يوم 25، وخاص لكل عائلة)، تقرير صدر، ترم جديد خلال 21 يومًا، ترحيب، فعاليات، خطة الشهر، التحديث قبل الحصة، يوم المهارات، الرأي الشهري، متابعة بعد الحصة المجانية.')}</p>` : ''}</div>`;
 }
 MOD.home.push(() => isAdminish() ? msgCentreCard(null, false) : '');
-regAction('mc-open', d => { const it = msgCentreItems()[+d.i]; if (!it) return; S.cmp = null; composeModal({ tpl: it.tpl, aud: it.aud || 'active', pids: it.pids, lids: it.lids, extra: it.extra, amounts: it.amounts, months: it.months }) });
+const mcKey = it => [it.tpl, it.aud || '', (it.pids || []).join(','), (it.lids || []).join(',')].join('|');   // v4.7
+regAction('mc-open', d => { const all = msgCentreItems(); const it = d.k ? all.find(x => mcKey(x) === d.k) : all[+d.i]; if (!it) { toast(L('This item changed. Please look again.', 'تغيّر هذا البند. برجاء المراجعة مرة أخرى.')); return } S.cmp = null; composeModal({ tpl: it.tpl, aud: it.aud || 'active', pids: it.pids, lids: it.lids, extra: it.extra, amounts: it.amounts, months: it.months }) });
 /* WhatsApp from the composer: a warning first when outside quiet hours or over the weekly cap; then open, log, tick */
 regAction('wa-send', async (d, el) => {
   if (d.warn && !confirm(d.warn)) return;
@@ -3251,7 +3273,7 @@ regAction('uni-paid', d => payModal(d.id));
 MOD.settingsTabs.push(['biz', ['Business', 'الأعمال'], () => {
   const s = S.draft || SET(); const q = s.quiet_hours || {}; const po = s.plan_owners || {}; const team = bizTeam();
   return `<h3>${L('Messages', 'الرسائل')}</h3><div class="grid2"><label class="f">${L('Quiet hours from', 'ساعات الهدوء من')}<input class="in" type="time" data-set="quiet_hours.from" value="${esc(q.from || '')}"></label><label class="f">${L('to', 'إلى')}<input class="in" type="time" data-set="quiet_hours.to" value="${esc(q.to || '')}"></label>
-   <label class="f">${L('Weekly cap per family (messages in 7 days; 0 = no cap)', 'الحد الأسبوعي لكل عائلة (رسائل في 7 أيام؛ 0 = بلا حد)')}<input class="in" type="number" min="0" max="20" data-num="1" data-set="weekly_msg_cap" value="${esc(s.weekly_msg_cap == null ? 3 : s.weekly_msg_cap)}"></label></div>
+   <label class="f">${L('Weekly cap per family (messages in 7 days; 0 = no cap)', 'الحد الأسبوعي لكل عائلة (رسائل في 7 أيام؛ 0 = بلا حد)')}<input class="in" type="number" min="0" max="20" data-num="1" data-set="weekly_msg_cap" value="${esc(s.weekly_msg_cap == null ? 0 : s.weekly_msg_cap)}"></label></div>
    <p class="tiny muted">${L('Outside quiet hours or over the cap the app warns before WhatsApp opens; you decide.', 'خارج ساعات الهدوء أو فوق الحد، ينبّهك التطبيق قبل أن يفتح واتساب؛ والقرار لك.')}</p>
    <h3>${L('Uniforms', 'الزي')}</h3><label class="f" style="max-width:260px">${L('Uniform price (per child)', 'سعر الزي (للطفل)')}<input class="in" type="number" min="0" data-num="1" data-set="uniform_price" value="${esc(s.uniform_price || '')}"></label>
    <h3>${L('Weekly plan owners', 'مسؤولو خطة الأسبوع')}</h3><div class="grid2">${team.map(x => `<label class="f">${esc(L(x.en, x.ar))}<input class="in" data-set="plan_owners.${x.key}" value="${esc(po[x.key] || x.name)}"></label>`).join('')}</div>
@@ -3424,8 +3446,8 @@ regAction('reconfirm-open', d => {
    <label class="f">${L('What matters most?', 'ما الأهم؟')}<select class="in" name="matters_most">${opt(HOPES, ex.matters_most || '', '–')}</select></label><label class="f">${L('Anything else? (optional)', 'شيء آخر؟ (اختياري)')}<textarea class="in" name="note">${esc(ex.note || '')}</textarea></label>
    <h3>${L('Renew your choices', 'جدّدوا اختياراتكم')}</h3>
    <label class="row small"><input type="checkbox" name="consent_dev" ${p.consent_dev === 'yes' ? 'checked' : ''}> ${L(`${brandName()} keeps my child’s attendance and progress and reports to me.`, `${brandName()} تحتفظ بحضور طفلي وتقدّمه وتبلغني.`)}</label>
-   <label class="row small"><input type="checkbox" name="consent_emergency" ${p.consent_emergency !== 'no' ? 'checked' : ''}> ${L('In an emergency the academy may seek first aid or medical help and call the emergency contact.', 'في الطوارئ يمكن للأكاديمية طلب إسعاف أو مساعدة طبية والاتصال برقم الطوارئ.')}</label>
-   <label class="row small"><input type="checkbox" name="consent_rules" ${p.consent_rules !== 'no' ? 'checked' : ''}> ${L('I have read the academy rules.', 'قرأت قواعد الأكاديمية.')}</label>
+   <label class="row small"><input type="checkbox" name="consent_emergency" ${p.consent_emergency === 'yes' ? 'checked' : ''}> ${L('In an emergency the academy may seek first aid or medical help and call the emergency contact.', 'في الطوارئ يمكن للأكاديمية طلب إسعاف أو مساعدة طبية والاتصال برقم الطوارئ.')}</label>
+   <label class="row small"><input type="checkbox" name="consent_rules" ${p.consent_rules === 'yes' ? 'checked' : ''}> ${L('I have read the academy rules.', 'قرأت قواعد الأكاديمية.')}</label>
    <label class="row small"><input type="checkbox" name="consent_app" ${p.consent_app === 'yes' ? 'checked' : ''}> ${L('Photos may be shared with our family inside the app.', 'يمكن مشاركة الصور معنا داخل التطبيق.')}</label>
    <label class="row small"><input type="checkbox" name="consent_public" ${p.consent_public === 'yes' ? 'checked' : ''}> ${L(`Photos may be posted on ${brandName()}’s public pages.`, `يمكن نشر الصور على صفحات ${brandName()} العامة.`)}</label>
    ${isPartner() ? '' : `<label class="row small"><input type="checkbox" name="consent_learning" ${p.consent_learning === 'yes' ? 'checked' : ''}> ${L('Coded records with no names may improve the HOST protocol.', 'يمكن للسجلات المرمّزة بلا أسماء أن تحسّن بروتوكول HOST.')}</label>`}
@@ -3493,7 +3515,7 @@ function groupsBox(s) {
 function childNotesBox(s) {
   const pe = pe7(s.id); if (!pe || pe.error) return '';
   const rows = Object.keys(pe.notes || {}).filter(pid => pe.notes[pid].length && P(pid)).sort((a, b) => String(P(a).name).localeCompare(String(P(b).name), 'ar'))
-    .map(pid => `<li><b>${esc(P(pid).name)}</b> · ${pe.notes[pid].map(n => esc(catName(n.cat)) + ': ' + L(...NOTEK[n.kind])).join(' · ')}${worksLine(pid)}</li>`);
+    .map(pid => `<li><b>${esc(P(pid).name)}</b> · ${pe.notes[pid].map(n => esc(catName(n.cat)) + ': ' + L(...(NOTEK[n.kind] || [esc(n.kind), esc(n.kind)]))).join(' · ')}${worksLine(pid)}</li>`);
   return rows.length ? `<h3>${L('On today’s focus', 'على تركيز اليوم')}</h3><ul class="small">${rows.join('')}</ul><p class="tiny muted">${L('From levels and your own ratings so far. You decide what to do with it.', 'من المستويات وتقييماتك حتى الآن. القرار لك.')}</p>` : '';
 }
 function worksLine(pid) { const w = ((D().coachEffect || {}).works || {})[pid]; return w ? ` · <span class="tag ok">${L('works: ', 'ينجح: ')}${esc(apprName(w.approach))} (${w.landed}/${w.n})</span>` : '' }
@@ -3903,7 +3925,7 @@ MOD.parentCards.push(() => {
    and the staff side of all of it (owner modal from the player file, coach Today card, owner Home card, a Settings tab). */
 
 /* ---------- offline-safe family writes: a parent's tap is kept on the phone until the Sheet confirms it */
-const famNow = () => todayStr() + new Date().toISOString().slice(10);   // the academy's date with this phone's time: local rows line up with what the server will stamp
+const famNow = () => { try { const now = new Date(); const pt = {}; new Intl.DateTimeFormat('en-GB', { timeZone: SET().tz || 'Africa/Cairo', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).formatToParts(now).forEach(x => { pt[x.type] = x.value }); const h = pt.hour === '24' ? '00' : pt.hour; const off = Math.round((Date.UTC(+pt.year, +pt.month - 1, +pt.day, +h, +pt.minute, +pt.second) - now.getTime()) / 60000); const sg = off < 0 ? '-' : '+', a = Math.abs(off); return `${pt.year}-${pt.month}-${pt.day}T${h}:${pt.minute}:${pt.second}${sg}${pad(Math.floor(a / 60))}:${pad(a % 60)}` } catch (e) { return new Date().toISOString() } };   // v4.7: the academy's own date and clock, with its offset (never a time in the future)   // the academy's date with this phone's time: local rows line up with what the server will stamp
 /* every parent or child tap goes through the outbox: kept on the phone, sent when the signal allows, the answer lands in the right local table */
 function queueFam(kind, rec, local) { obPut({ key: 'fam|' + kind + '|' + (rec.id || rec.player_id + '|' + (rec.date || rec.week || rec.month || '')), a: 'family', body: { kind, rec }, kind: (local && local[0] && local[0][0]) || 'none', local: local || [] }); toast('✓ ' + w('saved')) }
 function queueAct(a, body, kind, local, key) { obPut({ key: key || (a + '|' + ((body.rec && body.rec.id) || body.id || (Date.now() + Math.random()))), a, body, kind: kind || 'none', local: local || [] }); toast('✓ ' + w('saved')) }
@@ -3952,7 +3974,7 @@ const PSURVEY = () => [
 function psurveyModal(pid) {
   modal(`<h2>${L('This month', 'هذا الشهر')}</h2><p class="tiny muted">${L('Taps only. Only the academy owners read the answers; coaches never see them by name.', 'ضغطات فقط. يقرأ الإجابات أصحاب الأكاديمية؛ ولا يراها المدربون بالاسم.')}</p>
    <form id="psurveyForm" data-pid="${pid}" class="survey">${(() => { const CORE = ['experience', 'recommend', 'value', 'off', 'coach', 'progress']; const all = PSURVEY(); const a = all.filter(q => CORE.indexOf(q[0]) >= 0), b = all.filter(q => CORE.indexOf(q[0]) < 0); const row = (q, i) => `<div class="f q"><span class="qn">${i + 1}</span> ${q[1]}${q[2]}</div>`;
-     return a.map(row).join('') + (b.length ? `<details class="sv-more"><summary class="small" style="cursor:pointer;font-weight:600;margin:8px 0">${L(`${b.length} more questions, only if you have time`, `أسئلة إضافية: ${b.length}، فقط إن كان لديكم وقت`)}</summary>${b.map((q, i) => row(q, a.length + i)).join('')}</details>` : '') })()}
+     return a.map(row).join('') + (b.length ? `<details class="sv-more"><summary class="small" style="cursor:pointer;font-weight:600;margin:8px 0">${L(`${b.length} more questions, only if you have time`, `أسئلة إضافية: ${b.length}، فقط إن كان لديكم وقت`)}</summary>${b.map((q, i) => row(q, a.length + i)).join('').replace(/ required(?=[ >])/g, '')}</details>` : '') })()}
    <div class="row"><button class="btn" type="submit">${L('Send', 'أرسل')}</button><button class="btn ghost" type="button" data-act="modal-close">${w('cancel')}</button></div></form>`);
 }
 regAction('psurvey-open', d => psurveyModal(d.pid));
@@ -3986,7 +4008,7 @@ regAction('ev-open', d => {
   const named = canSeeLevels() || e.changes.every(c => c.named);
   modal(`<h2>${esc(L(e.en, e.ar))}</h2><p class="small muted">${esc(catName(e.cat))}</p>
    <div class="kpis">${kv(L('Observations', 'ملاحظات'), num(e.n))}${kv(L('Observed by', 'لاحظها'), esc(e.observers.join(', ') || '–'))}${kv(L('Confidence', 'الثقة'), confTag(e.conf))}</div>
-   <h3>${L('Dated changes', 'التغييرات بتواريخها')}</h3><div class="list">${e.changes.map(c => `<div class="item" style="cursor:default;align-items:flex-start"><div class="grow"><div class="sub">${fmtDS(c.date)} · ${esc(c.by || '')} · ${L(`${c.n} observations`, `الملاحظات: ${c.n}`)}</div><div>${c.first ? L('Starting point set', 'تم تحديد نقطة البداية') : L('Moved up', 'تقدّم')}${(canSeeLevels() || c.named) ? ': <b>' + levelName(c.to) + '</b>' + (levelPlain(c.to) ? ' · ' + esc(levelPlain(c.to)) : '') : ''}</div>${c.around.length ? `<ul class="small muted">${c.around.map(n => `<li>${fmtDS(n.date)} · ${esc(n.by || '')}: ${esc(n.text)}</li>`).join('')}</ul>` : ''}</div></div>`).join('')}</div>
+   <h3>${L('Dated changes', 'التغييرات بتواريخها')}</h3><div class="list">${e.changes.map(c => `<div class="item" style="cursor:default;align-items:flex-start"><div class="grow"><div class="sub">${fmtDS(c.date)} · ${esc(c.by || '')} · ${L(`${c.n} observations`, `الملاحظات: ${c.n}`)}</div><div>${c.first ? L('Starting point set', 'تم تحديد نقطة البداية') : L('Moved up', 'تقدّم')}${(canSeeLevels() || c.named) ? ': <b>' + levelName(c.to) + '</b>' + (levelPlain(c.to) ? ' · ' + esc(levelPlain(c.to)) : '') : ''}</div>${c.around.length ? `<ul class="small muted">${c.around.map(n => `<li>${fmtDS(n.date || String(n.at || '').slice(0, 10))} · ${esc(n.by || '')}: ${esc(n.text)}</li>`).join('')}</ul>` : ''}</div></div>`).join('')}</div>
    <h3>${L('How we measure', 'كيف نقيس')}</h3><p class="small">${isLight() ? L('Your child’s coach records the same simple exercises every time (coach-recorded). Every 4 sessions your child attends we look at what he recorded: a skill moves up only when two or more of those sessions show the next step, the latest included. The academy checks that its coaches rate the same way, and a level is never moved down in what you read.', 'يسجّل مدرب طفلك نفس التمارين البسيطة كل مرة (سجّلها المدرب). كل 4 حصص يحضرها طفلك ننظر فيما سجّله: تتقدّم المهارة عندما تُظهر حصتان أو أكثر منها الخطوة التالية، ومنها الأخيرة. وتتأكد الأكاديمية من أن المدربين يقيّمون بنفس الطريقة، ولا ينخفض المستوى أبدًا فيما تقرؤونه.') : L('Two HOST evaluators watch the same simple exercises every time, each recording alone. Every 4 sessions your child attends we look at what they saw: a skill moves up only when two or more of those sessions show the next step, the latest included. We never take a level from a session where the two disagreed widely, and a level is never moved down in what you read.', 'مقيّمون من HOST يشاهدون نفس التمارين البسيطة كل مرة، ويسجّل كل منهم وحده. كل 4 حصص يحضرها طفلك ننظر فيما شاهدوه: تتقدّم المهارة عندما تُظهر حصتان أو أكثر منها الخطوة التالية، ومنها الأخيرة. لا نأخذ مستوى من حصة اختلف فيها الاثنان كثيرًا، ولا ينخفض المستوى أبدًا فيما تقرؤونه.')}${named ? '' : ' ' + L('The name of the level appears once these two evaluators have been checked against each other.', 'يظهر اسم المستوى عندما يتم التأكد من أن هذين المقيّمين يريان الشيء نفسه.')}</p>
    <button class="btn ghost" data-act="modal-close">${w('close')}</button>`);
 });
@@ -4171,7 +4193,7 @@ MOD.parentCards.push(() => {
   let body;
   if (!k.age_ok) body = `<p class="small muted">${L(`A child’s own login starts at age ${K.min_age}. Until then ${first}’s page opens from your login (“Open ${first}’s page”).`, `يبدأ دخول الطفل بنفسه من سن ${K.min_age}. حتى ذلك الحين تُفتح صفحة ${first} من دخولك.`)}</p>`;
   else if (k.player_login !== 'on') body = `<p class="small">${L(`${first} can have a login of their own on their own phone. You choose the PIN; you can switch it off at any time.`, `يمكن أن يكون لـ${first} دخول خاص على هاتفه. أنت من يختار الرقم السري، ويمكنك إيقافه في أي وقت.`)}</p>
-     <form id="klSetForm" data-pid="${esc(p.id)}" class="grid2"><label class="f">${L(`${first}’s own mobile number`, `رقم هاتف ${first}`)}<input class="in" name="phone" inputmode="tel" required></label><label class="f">${L('PIN for the child (4 digits, not your own PIN)', 'رقم سري للطفل (4 أرقام، ليس رقمك)')}<input class="in" name="pin" inputmode="numeric" pattern="\\d{4}" maxlength="4" required></label>
+     <form id="klSetForm" data-pid="${esc(p.id)}" class="grid2"><label class="f">${L(`${first}’s own mobile number`, `رقم هاتف ${first}`)}<input class="in" name="phone" inputmode="tel" required></label><label class="f">${L('PIN for the child (4 digits, not your own PIN)', 'رقم سري للطفل (4 أرقام، ليس رقمك)')}<input class="in" name="pin" inputmode="numeric" pattern="[0-9\u0660-\u0669\u06F0-\u06F9]{4}" maxlength="4" required></label>
      <div class="row" style="grid-column:1/-1"><button class="btn" type="submit">${L('Switch on', 'فعّل')}</button></div></form>
      <p class="tiny muted">${L('A child without a phone keeps opening the child page from your login.', 'الطفل الذي ليس لديه هاتف يظل يفتح صفحته من دخولك.')}</p>`;
   else body = `<p class="small"><span class="tag ok">${L('On', 'مُفعّل')}</span> ${L('Number', 'الرقم')}: <b dir="ltr">${esc(lgMask(k.player_phone))}</b> · ${L('last login', 'آخر دخول')}: ${k.player_last_login ? fmtDS(String(k.player_last_login).slice(0, 10)) : L('not yet', 'ليس بعد')} · ${L('logins', 'مرات الدخول')}: ${act7.logins || 0} · ${L('“I did it” (4 weeks)', '«أنجزتها» (4 أسابيع)')}: ${act7.did_it_4w || 0} · ${L('lessons (4 weeks)', 'دروس (4 أسابيع)')}: ${act7.lessons_4w || 0}</p>
@@ -4182,10 +4204,10 @@ MOD.parentCards.push(() => {
      ${m.status === 'pending' ? `<div class="row wrap"><button class="btn small" data-act="kl-share" data-id="${esc(m.id)}" data-v="approve">${L('Share', 'شارك')}</button>${m.type !== 'free' ? `<button class="btn ghost small" data-act="kl-share" data-id="${esc(m.id)}" data-v="always">${L('Share, and this kind from now on', 'شارك، وهذا النوع من الآن')}</button>` : ''}<button class="link small" data-act="kl-share" data-id="${esc(m.id)}" data-v="decline">${L('Not now', 'ليس الآن')}</button></div>` : ''}</div>`).join('')}</div>` : '';
   return `<div class="card" data-card="kidlogin"><div class="row sp"><h2>${L(`${first}’s own login`, `دخول ${first} الخاص`)}</h2>${pend.length ? `<span class="tag warn">${pend.length} ${L('waiting', 'بانتظار')}</span>` : ''}</div>${body}${list}</div>`;
 });
-regForm('klSetForm', async (o, f) => { try { const j = await act('kid_login_set', { player_id: f.dataset.pid, phone: o.phone, pin: o.pin }); D().kid_logins[f.dataset.pid] = Object.assign({}, D().kid_logins[f.dataset.pid], j.rec); S.klReset = null; rerender() } catch (e) { } });
+regForm('klSetForm', async (o, f) => { try { const j = await act('kid_login_set', { player_id: f.dataset.pid, phone: o.phone, pin: o.pin }); (D().kid_logins = D().kid_logins || {})[f.dataset.pid] = Object.assign({}, D().kid_logins[f.dataset.pid], j.rec); S.klReset = null; rerender() } catch (e) { } });
 regAction('kl-reset', d => { const k = (D().kid_logins || {})[d.pid]; if (k) k.player_login = ''; rerender() });
-regAction('kl-off', async d => { if (!confirm(L('Switch off your child’s own login? Your child is signed out on every phone at once.', 'هل توقف دخول طفلك الخاص؟ سيخرج من كل الأجهزة فورًا.'))) return; try { const j = await act('kid_login_off', { player_id: d.pid }); D().kid_logins[d.pid] = Object.assign({}, D().kid_logins[d.pid], j.rec); rerender() } catch (e) { } });
-regAction('kl-auto', async d => { const k = (D().kid_logins || {})[d.pid] || {}; const on = (k.kid_auto || []).indexOf(d.v) < 0; try { const j = await act('kid_auto_set', { player_id: d.pid, type: d.v, on }, true); D().kid_logins[d.pid] = Object.assign({}, k, j.rec); rerender() } catch (e) { } });
+regAction('kl-off', async d => { if (!confirm(L('Switch off your child’s own login? Your child is signed out on every phone at once.', 'هل توقف دخول طفلك الخاص؟ سيخرج من كل الأجهزة فورًا.'))) return; try { const j = await act('kid_login_off', { player_id: d.pid }); (D().kid_logins = D().kid_logins || {})[d.pid] = Object.assign({}, D().kid_logins[d.pid], j.rec); rerender() } catch (e) { } });
+regAction('kl-auto', async d => { const k = (D().kid_logins || {})[d.pid] || {}; const on = (k.kid_auto || []).indexOf(d.v) < 0; try { const j = await act('kid_auto_set', { player_id: d.pid, type: d.v, on }, true); (D().kid_logins = D().kid_logins || {})[d.pid] = Object.assign({}, k, j.rec); rerender() } catch (e) { } });
 regAction('kl-share', async d => { try { const j = await act('share', { note_id: d.id, decision: d.v === 'decline' ? 'decline' : 'approve', always: d.v === 'always' }, true); const m = (D().kid_msgs || []).find(x => x.id === d.id); if (m) m.status = j.rec.child_share; upsertLocal('notes', Object.assign({}, (D().notes || []).find(n => n.id === d.id) || { id: d.id }, { child_share: j.rec.child_share })); await reload() } catch (e) { } });
 
 /* ---------- the academy: a message to a child (coach Today and owner Home), and the log */
@@ -4486,7 +4508,7 @@ function kmFitBlock(p, kid) {
    ${!kid && routines.length ? `<details><summary class="small"><b>${L('Routines (warm-up, cool-down, morning, bedtime)', 'الروتين (إحماء، تهدئة، الصبح، قبل النوم)')}</b></summary>${routines.map(r => `<div class="km-routine"><b>${esc(L(r.title_en, r.title_ar))}</b><ul class="small">${((r.body || {}).steps || []).concat((r.body || {}).checklist || []).map(x => `<li>${esc(LLang(x.name || x, lg))}${x.dose ? ' · ' + esc(LLang(x.dose, lg)) : ''}</li>`).join('')}</ul>${(r.body || {}).note ? `<p class="tiny muted">${esc(LLang(r.body.note, lg))}</p>` : ''}</div>`).join('')}</details>` : ''}
    ${!kid && advice.length ? `<details><summary class="small"><b>${L('Advice for parents', 'نصائح للأهل')}</b> <span class="muted">(${advice.length})</span></summary><div class="km-advice">${advice.map(a => `<div class="km-adv"><b>${esc(L(a.title_en, a.title_ar))}</b><p class="small">${esc(LLang((a.body || {}).text, lg))}</p></div>`).join('')}</div></details>` : ''}</div>`;
 }
-regAction('km-tick', (d, el) => { if (!isParent() && !isOwnerish()) return; kmTick(d.pid, d.ref, d.done === '1'); if (d.done === '1' && kmS().kid) toast('⭐ ' + L('Well done!', 'أحسنت!')); rerender() });
+regAction('km-tick', (d, el) => { if (!isParent() && !isOwnerish() && !(isPlayer() && P(d.pid))) return; kmTick(d.pid, d.ref, d.done === '1'); if (d.done === '1' && kmS().kid) toast('⭐ ' + L('Well done!', 'أحسنت!')); rerender() });
 function kmLearnBlock(p, kid) {
   const lessons = kmLessonsFor(p); const lg = isAr() ? 'ar' : 'en';
   if (!lessons.length && kid) return '';   // v4.5 review: no empty 'coming soon' boxes on the child's page
@@ -4555,7 +4577,7 @@ const IX_LVL = { high: ['HIGH', 'عالٍ'], medium: ['MEDIUM', 'متوسط'], l
 const IX_CARD = { growth: ['Business growth', 'نمو الأكاديمية'], families: ['Families & feedback', 'العائلات وآراؤهم'], sessions: ['Session health', 'صحة الحصص'], dev: ['Development picture', 'صورة التطوّر'], rel: ['Relationships', 'العلاقات'], money: ['Money', 'المالية'], setup: ['Setup advice', 'نصائح الإعداد'] };
 const ixD = () => D().intel || null;
 const ixDom = k => { const d = ((ixD() || {}).domains || {})[k]; return d ? L(d[0], d[1]) : k };
-const ixLvlTag = l => `<span class="tag lvl lvl-${l}">${esc(L(IX_LVL[l][0], IX_LVL[l][1]))}</span>`;
+const ixLvlTag = l => `<span class="tag lvl lvl-${l}">${esc(L(...((IX_LVL[l] || [l, l]).slice(0, 2))))}</span>`;
 const ixDomTag = k => `<span class="tag dom">${esc(ixDom(k))}</span>`;
 const ixVal = (v, kind, reason) => v == null ? `<span class="muted" title="${esc(reason === 'under5' ? L('Fewer than 5 answers: no average shown', 'أقل من 5 إجابات: لا يوجد متوسط') : L('Not collected yet', 'لم تُجمع بعد'))}">${reason === 'under5' ? L('under 5', 'أقل من 5') : '–'}</span>` : kind === 'sum' ? num(v) : fmtVal(v, kind);
 const ixKpis = kpis => `<div class="kpis">${kpis.map(k => kpiTile(esc(L(k.label_en, k.label_ar)), ixVal(k.value, k.kind, k.hidden_reason), { n: k.n, delta: k.value == null || k.prev == null ? null : k.delta, kind: k.kind, conf: k.conf })).join('')}</div>`;
@@ -4914,7 +4936,7 @@ function mdViewer(m, f) {
   const fname = (m.kind === 'video' ? 'video' : 'photo') + '_' + String(m.at).slice(0, 10) + (m.kind === 'video' ? '.mp4' : '.jpg');
   modal(`<div class="md-view">${media}
    <div class="row sp" style="margin-top:8px"><div>${m.caption ? `<b>${v45Esc(L(m.caption, m.caption_ar || m.caption))}</b><br>` : ''}<span class="tiny muted">${fmtD(String(m.at).slice(0, 10))}${ses ? ' · ' + v45Esc(groupLabel(ses.group_id)) : m.group_id ? ' · ' + v45Esc(groupLabel(m.group_id)) : ''}${!isParent() ? ' · ' + L('by ', 'من ') + v45Esc(m.by) : ''}</span></div>
-   ${!isParent() ? `<span class="tag ${m.status === 'review' ? 'warn' : 'ok'}">${L(MD_ST[m.status][0], MD_ST[m.status][1])}</span>` : ''}</div>
+   ${!isParent() ? `<span class="tag ${m.status === 'review' ? 'warn' : 'ok'}">${L(...((MD_ST[m.status] || [esc(m.status), esc(m.status)]).slice(0, 2)))}</span>` : ''}</div>
    ${!isParent() ? `<p class="small">${mdAudTxt(m.audience)}${m.post_id ? ' · ' + L('in the content plan', 'في خطة المحتوى') : ''}</p>` : ''}
    ${tags ? `<div class="chips">${tags}</div>` : ''}${m.note && !isParent() ? `<p class="tiny muted">${v45Esc(m.note)}</p>` : ''}
    <div class="row wrap" style="margin-top:10px">
@@ -5560,7 +5582,7 @@ const BDEF = () => D().basicDef || { bands: [], skills: [] };
 const bDef = id => BDEF().skills.find(b => b.id === id) || null;
 function bBand(p) { const a = p && p.dob ? age(p.dob) : ''; const n = a === '' ? 10 : +a; return n <= 8 ? 'y' : n <= 12 ? 'm' : 't' }
 function basicName(id, p) { const b = bDef(id); if (!b) return id; const x = b.n[p ? bBand(p) : 'm']; return L(x[0], x[1]) }
-function basicCan(id, p, lv) { const b = bDef(id); if (!b || !(lv >= 1 && lv <= 4)) return ''; const x = b.can[bBand(p)][lv - 1]; return L(x[0], x[1]) }
+function basicCan(id, p, lv) { const b = bDef(id); if (!b || !(lv >= 1 && lv <= 4)) return ''; const x = ((b.can || {})[bBand(p)] || [])[lv - 1]; return x ? L(x[0], x[1]) : '' }
 /* HOST Egypt: every protocol area an evaluator rates sits under one basic skill (shown as a tag on the record screen) */
 function bOfCat(cat) { const b = BDEF().skills.find(x => x.ev.indexOf(String(cat)) >= 0 || x.char.indexOf(String(cat)) >= 0); return b ? b.id : '' }
 function basicParts(id) { const b = bDef(id); if (!b) return []; return skills().filter(k => b.ev.indexOf(k.cat) >= 0 && k.core && +k.phase === 1) }
